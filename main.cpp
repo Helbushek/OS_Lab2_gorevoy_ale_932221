@@ -8,6 +8,9 @@
 #include <chrono>
 #include <cstring>
 
+#include <signal.h>
+#include <csignal>
+
 int serverSocket;
 int clientSocket;
 constexpr int PortNumber = 8009;
@@ -15,50 +18,66 @@ constexpr int PortNumber = 8009;
 bool isFinished = false;
 bool isConnected = false;
 
-void Receive()
-{
-    int bufferSize = 1024;
-    char buffer[1024];
-
-    while (!isFinished)
-    {
-        int bytesReceived = recv(clientSocket, buffer, bufferSize, 0);
-
-        if (bytesReceived == -1)
-        {
-            std::cerr << "Recv error" << std::endl;
-            std::cout << strerror(errno) << std::endl;
-        }
-        else if (bytesReceived == 0)
-        {
-            std::cout << "Connection closed by peer" << std::endl;
-            isConnected = false;
-            return;
-        }
-        else 
-        {
-            std::cout << "Bytes received: " << std::to_string(bytesReceived) << " bytes: ";
-            std::cout.write(buffer, bytesReceived) << std::endl;
-        }
-
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-}
+volatile sig_atomic_t wasSigHup = 0;
 
 void Server()
 {
     while (!isFinished)
     {
-        sockaddr_in clientAddress;
-        socklen_t clientAddressSize = sizeof(clientAddress);
-        clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddress, &clientAddressSize);
-        if (clientSocket == -1) 
+        fd_set readfds;
+        FD_ZERO(&readfds);
+    
+        FD_SET(serverSocket, &readfds);
+        int maxFd = serverSocket;
+
+        FD_SET(clientSocket, &readfds);
+        if (clientSocket > maxFd)
         {
-            std::cout << "Error during connection acception" << std::endl;
+            maxFd = clientSocket;
         }
-        std::cout << "Accepted connection" << std::endl;
-        
-        Receive();
+
+        int ready = select(maxFd + 1, &readfds, nullptr, nullptr, nullptr);
+
+        if (ready == -1)
+        {
+            std::cerr << strerror(errno) << std::endl;
+            break;
+        }
+
+        if (FD_ISSET(serverSocket, &readfds) && !isConnected)
+        {
+            sockaddr_in cliaddr{};
+            socklen_t len = sizeof(cliaddr);
+            clientSocket = accept(serverSocket, (sockaddr*)&cliaddr, &len);
+
+            if (clientSocket >= 0)
+            {
+                std::cout << "Connected: " << std::to_string(clientSocket) << std::endl;
+            }
+            isConnected = true;
+        }
+
+        if (!isConnected)
+        {
+            continue;
+        }
+
+        int fd = clientSocket;
+        if (FD_ISSET(fd, &readfds))
+        {
+            char buf[1024];
+            ssize_t n = recv(fd, buf, sizeof(buf), 0);
+
+            if (n <= 0)
+            {
+                std::cout << "Client disconnected" << std::endl;
+                isConnected = false;
+            }
+            else
+            {
+                std::cout << "Received " << std::to_string(n) << " bytes: " << std::string(buf) << std::endl;
+            }
+        }
     }
 }
 
@@ -86,12 +105,34 @@ void InitializeServer()
     {
         std::cout << "Error during socket listen" << std::endl;
     }
+}
 
-    Server();
+extern "C" void SignalHandler(int signum)
+{
+    wasSigHup = signum;
+    std::cout << "Caught signal " << signum << ". Exiting gracefully..." << std::endl;
+    // Perform necessary cleanup here
+    exit(signum);
 }
 
 int main()
 {
-    std::thread serverThread(InitializeServer);
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+
+    sa.sa_handler = SignalHandler;
+
+    sa.sa_flags = SA_RESTART;
+
+    if (sigaction(SIGHUP, &sa, NULL) == -1) {
+        std::cerr << "Error registering SIGINT handler" << std::endl;
+        return EXIT_FAILURE;
+    }
+
+    InitializeServer();
+
+    std::thread serverThread(Server);
     serverThread.join();
+
+    return EXIT_SUCCESS;
 }
